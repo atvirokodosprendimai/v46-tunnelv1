@@ -1,5 +1,39 @@
-# `go build ./...` writes an executable per main package into the working
-# directory, so the two binaries land here by accident rather than on purpose.
+# If you prefer the allow list template instead of the deny list, see community template:
+# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
+#
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# This project's own binaries. `go build ./...` writes an executable per main
+# package into the working directory, so these land here by accident rather than
+# on purpose — the patterns above do not catch an extensionless Unix binary.
 /tunneld
 /tunnel-agent
 /bin/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage profiles and other test artifacts
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+
+# Editor/IDE
+# .idea/
+# .vscode/

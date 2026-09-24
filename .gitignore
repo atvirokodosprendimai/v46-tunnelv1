@@ -1,1 +1,5 @@
+# `go build ./...` writes an executable per main package into the working
+# directory, so the two binaries land here by accident rather than on purpose.
+/tunneld
+/tunnel-agent
 /bin/

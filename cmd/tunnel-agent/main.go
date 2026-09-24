@@ -42,7 +42,35 @@ func main() {
 			&cli.UintFlag{
 				Name:  "dir-port",
 				Value: 8080,
-				Usage: "published port for --dir; added to --ports automatically",
+				Usage: "published port for --dir; added to --ports automatically, and ignored when a certificate is requested (that moves --dir to 80 and 443)",
+			},
+			&cli.StringFlag{
+				Name:  "domain",
+				Usage: "obtain a certificate for this hostname and serve --dir over TLS; you must point its DNS record at the leased address yourself",
+			},
+			&cli.BoolFlag{
+				Name:  "acme",
+				Usage: "obtain a certificate for the hostname the server assigns from its --zone; use instead of --domain when the server names you",
+			},
+			&cli.BoolFlag{
+				Name:  "acme-accept-tos",
+				Usage: "accept the certificate authority's subscriber agreement; required with --domain or --acme",
+			},
+			&cli.StringFlag{
+				Name:  "acme-directory",
+				Usage: "ACME endpoint (default: Let's Encrypt production). Use the staging URL while debugging — production rate limits are low enough to hit in one afternoon",
+			},
+			&cli.BoolFlag{
+				Name:  "acme-staging",
+				Usage: "shorthand for --acme-directory pointing at Let's Encrypt staging; issues untrusted certificates against far looser limits",
+			},
+			&cli.StringFlag{
+				Name:  "acme-cache",
+				Usage: "directory for issued certificates and the ACME account key (default: a per-user cache directory). Losing it means re-issuing on every restart",
+			},
+			&cli.StringFlag{
+				Name:  "acme-email",
+				Usage: "contact address the CA uses for expiry warnings",
 			},
 			&cli.StringFlag{
 				Name:  "target",
@@ -105,6 +133,11 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		log.Warn("server certificate verification is disabled; anything on the path can impersonate the server")
 	}
 
+	acmeConf, err := acmeConfigFrom(cmd)
+	if err != nil {
+		return err
+	}
+
 	ag, err := agent.New(agent.Config{
 		Server:    server,
 		Token:     cmd.String("token"),
@@ -112,6 +145,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		Target:    cmd.String("target"),
 		ServeDir:  serveDir,
 		ServePort: uint16(dirPort),
+		ACME:      acmeConf,
 		Logger:    log,
 	})
 	if err != nil {

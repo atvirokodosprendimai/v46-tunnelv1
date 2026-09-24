@@ -51,8 +51,11 @@ type Config struct {
 	// and is reachable only through the tunnel.
 	ServeDir string
 	// ServePort is the published port the directory is served on. It is added
-	// to Ports automatically when ServeDir is set.
+	// to Ports automatically when ServeDir is set, and ignored when ACME is
+	// enabled — a certificate moves the directory to 80 and 443.
 	ServePort uint16
+	// ACME, when enabled, obtains a certificate and serves ServeDir over TLS.
+	ACME ACMEConfig
 	// Logger receives structured events. Defaults to slog.Default().
 	Logger *slog.Logger
 }
@@ -65,7 +68,9 @@ type Agent struct {
 	udpIdle time.Duration
 	log     *slog.Logger
 
-	// files serves ServeDir when one was configured, and is nil otherwise.
+	// files serves ServeDir when one was configured, and is nil otherwise. It
+	// is built in Run rather than New, because with ACME the hostname to
+	// request a certificate for may come from the server's lease.
 	files *fileServer
 
 	// allowed is the set the agent itself will dial. It is derived from the
@@ -81,10 +86,10 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.Server == "" {
 		return nil, errors.New("agent: no server address")
 	}
+	if err := cfg.ACME.validate(cfg.ServeDir); err != nil {
+		return nil, err
+	}
 	if cfg.ServeDir != "" {
-		if cfg.ServePort == 0 {
-			return nil, errors.New("agent: serving a directory needs a port")
-		}
 		info, err := os.Stat(cfg.ServeDir)
 		if err != nil {
 			return nil, fmt.Errorf("agent: cannot serve %s: %w", cfg.ServeDir, err)
@@ -92,12 +97,21 @@ func New(cfg Config) (*Agent, error) {
 		if !info.IsDir() {
 			return nil, fmt.Errorf("agent: %s is not a directory", cfg.ServeDir)
 		}
-		// The served port is published whether or not the operator listed it,
-		// because a directory served on a port nobody can reach is not a
-		// configuration anyone wants.
-		spec := portspec.Spec{Port: cfg.ServePort, Proto: portspec.TCP}
-		if !slices.Contains(cfg.Ports, spec) {
-			cfg.Ports = append(cfg.Ports, spec)
+		// The served ports are published whether or not the operator listed
+		// them, because a directory served on a port nobody can reach is not a
+		// configuration anyone wants. With a certificate that is 80 and 443:
+		// issuance needs both, and a request against a port the server never
+		// bound fails looking like a CA problem rather than a config one.
+		served := []portspec.Spec{{Port: cfg.ServePort, Proto: portspec.TCP}}
+		if cfg.ACME.enabled() {
+			served = ACMEPorts
+		} else if cfg.ServePort == 0 {
+			return nil, errors.New("agent: serving a directory needs a port")
+		}
+		for _, spec := range served {
+			if !slices.Contains(cfg.Ports, spec) {
+				cfg.Ports = append(cfg.Ports, spec)
+			}
 		}
 	}
 	if len(cfg.Ports) == 0 {
@@ -123,11 +137,7 @@ func New(cfg Config) (*Agent, error) {
 	for _, spec := range cfg.Ports {
 		allowed[spec] = true
 	}
-	a := &Agent{cfg: cfg, target: target, timeout: timeout, udpIdle: udpIdle, log: log, allowed: allowed}
-	if cfg.ServeDir != "" {
-		a.files = newFileServer(cfg.ServeDir, cfg.ServePort, log)
-	}
-	return a, nil
+	return &Agent{cfg: cfg, target: target, timeout: timeout, udpIdle: udpIdle, log: log, allowed: allowed}, nil
 }
 
 // ErrRejected reports that the server refused the session for a stated reason.
@@ -162,11 +172,13 @@ func (a *Agent) Run(ctx context.Context, sess transport.Session) error {
 
 	ctl := proto.NewControlConn(control)
 	if err := ctl.Send(proto.Control{Hello: &proto.Hello{
-		Version: proto.Version,
-		Token:   a.cfg.Token,
-		OS:      runtime.GOOS,
-		Arch:    runtime.GOARCH,
-		Ports:   a.cfg.Ports,
+		Version:      proto.Version,
+		Token:        a.cfg.Token,
+		OS:           runtime.GOOS,
+		Arch:         runtime.GOARCH,
+		Ports:        a.cfg.Ports,
+		Domain:       a.cfg.ACME.Domain,
+		WantHostname: a.cfg.ACME.UseServerHostname,
 	}}); err != nil {
 		return fmt.Errorf("sending hello: %w", err)
 	}
@@ -181,6 +193,10 @@ func (a *Agent) Run(ctx context.Context, sess transport.Session) error {
 		"target", a.target)
 	for _, r := range lease.Refused {
 		a.log.Warn("port not published", "port", r.Spec.String(), "reason", r.Reason)
+	}
+
+	if err := a.startFileServer(lease); err != nil {
+		return err
 	}
 
 	conduit := tunnel.NewConduit(sess, udpStream)
@@ -205,8 +221,6 @@ func (a *Agent) Run(ctx context.Context, sess transport.Session) error {
 	// notices because a silent client produces no event at all.
 	wg.Go(func() { locals.sweepIdle(ctx) })
 	if a.files != nil {
-		a.log.Warn("serving a directory over the tunnel; anyone who reaches the leased address can read it",
-			"dir", a.cfg.ServeDir, "port", a.cfg.ServePort)
 		wg.Go(func() { a.files.start(ctx) })
 	}
 
@@ -308,12 +322,12 @@ func (a *Agent) serveStream(stream transport.Stream) {
 
 	// A served directory has no local socket to dial: the stream becomes the
 	// HTTP connection itself.
-	if a.files != nil && open.Port == a.cfg.ServePort {
+	if a.files != nil && a.files.serves(open.Port) {
 		if err := proto.WriteOpenResult(stream, proto.OpenOK); err != nil {
 			stream.Close()
 			return
 		}
-		a.files.handle(stream, open.Src)
+		a.files.handle(stream, open.Port, open.Src)
 		return
 	}
 

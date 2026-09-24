@@ -59,6 +59,14 @@ type Hello struct {
 	Arch    string            `json:"arch"`
 	Ports   []portspec.Spec   `json:"ports"`
 	Labels  map[string]string `json:"labels,omitempty"`
+	// Domain is the hostname the agent will obtain a certificate for, when it
+	// was given one explicitly. Empty means it either wants no certificate or
+	// is asking the server to name it — WantHostname says which.
+	Domain string `json:"domain,omitempty"`
+	// WantHostname asks the server to assign a hostname from its zone. It is
+	// separate from Domain because the agent has to declare the ACME ports
+	// before it knows what the server will call it.
+	WantHostname bool `json:"want_hostname,omitempty"`
 }
 
 // Refusal explains why one declared port was not published. A refusal is
@@ -77,6 +85,15 @@ type Lease struct {
 	Bound        []portspec.Spec `json:"bound"`
 	Refused      []Refusal       `json:"refused,omitempty"`
 	KeepaliveSec int             `json:"keepalive_sec"`
+	// Hostname is the name the server assigned from its zone, when it has one
+	// and the agent asked. It is a name, not a promise: the server does not
+	// create the DNS record, so the record pointing it at IP is the operator's
+	// to make.
+	Hostname string `json:"hostname,omitempty"`
+	// PoolMode is how this server allocates addresses, "sticky" or "random".
+	// The agent needs it to warn that a certificate on a domain is pointless
+	// against a server that will move the address on the next reconnect.
+	PoolMode string `json:"pool_mode,omitempty"`
 }
 
 // Error is a terminal control message: the session is over and this is why.

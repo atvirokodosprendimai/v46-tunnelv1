@@ -2,12 +2,15 @@ package agent
 
 import (
 	"context"
+	"crypto/tls"
 	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/acme/autocert"
 
 	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/transport"
 )
@@ -21,48 +24,109 @@ import (
 // the whole life of the tunnel. Serving the stream directly means the files
 // exist on exactly one path, the tunnel, and nothing local can reach them.
 type fileServer struct {
-	port     uint16
-	srv      *http.Server
-	listener *streamListener
+	// ports are the published ports this server answers on: one plain port
+	// when there is no certificate, or 80 and 443 when there is.
+	ports map[uint16]bool
+
+	// plain serves cleartext HTTP. Without a certificate it serves the files;
+	// with one it serves the ACME challenge and redirects everything else.
+	plain    *http.Server
+	plainLn  *streamListener
+	plainPrt uint16
+
+	// tlsSrv serves the files over TLS, and is nil when no certificate was
+	// asked for.
+	tlsSrv *http.Server
+	tlsLn  net.Listener
+	rawTLS *streamListener
 }
 
-// newFileServer builds a read-only HTTP server over dir, served on port.
-func newFileServer(dir string, port uint16, log *slog.Logger) *fileServer {
-	listener := newStreamListener(port)
-	mux := http.NewServeMux()
-	mux.Handle("/", loggingHandler(http.FileServer(http.Dir(dir)), log))
+// newFileServer builds a read-only HTTP server over dir.
+//
+// certs is nil for plain HTTP on plainPort. When it is set, the server ignores
+// plainPort and answers on 80 and 443 instead: 443 serves the files over TLS,
+// and 80 serves the HTTP-01 challenge and redirects everything else, which is
+// what makes issuance work through the tunnel.
+func newFileServer(dir string, plainPort uint16, certs *autocert.Manager, log *slog.Logger) *fileServer {
+	files := loggingHandler(http.FileServer(http.Dir(dir)), log)
 
-	return &fileServer{
-		port:     port,
-		listener: listener,
-		srv: &http.Server{
-			Handler:           mux,
-			ReadHeaderTimeout: 20 * time.Second,
-			// No write timeout: a large file over a slow link is the normal
-			// case here, and a deadline would truncate it mid-download.
-			IdleTimeout: 60 * time.Second,
-		},
+	f := &fileServer{ports: make(map[uint16]bool)}
+
+	if certs == nil {
+		f.plainPrt = plainPort
+		f.ports[plainPort] = true
+		f.plainLn = newStreamListener(plainPort)
+		f.plain = newHTTPServer(files)
+		return f
+	}
+
+	f.plainPrt = 80
+	f.ports[80] = true
+	f.ports[443] = true
+	f.plainLn = newStreamListener(80)
+	// HTTPHandler serves /.well-known/acme-challenge/ itself and hands
+	// everything else to the fallback — nil means redirect to https, which is
+	// the behaviour anyone reaching :80 on a certificated host expects.
+	f.plain = newHTTPServer(certs.HTTPHandler(nil))
+
+	f.rawTLS = newStreamListener(443)
+	f.tlsLn = tls.NewListener(f.rawTLS, certs.TLSConfig())
+	f.tlsSrv = newHTTPServer(files)
+	return f
+}
+
+// newHTTPServer builds an http.Server with the timeouts a file server wants.
+func newHTTPServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 20 * time.Second,
+		// No write timeout: a large file over a slow link is the normal case
+		// here, and a deadline would truncate it mid-download.
+		IdleTimeout: 60 * time.Second,
 	}
 }
+
+// serves reports whether this server answers on a published port.
+func (f *fileServer) serves(port uint16) bool { return f.ports[port] }
 
 // start serves until ctx is done.
 func (f *fileServer) start(ctx context.Context) {
 	go func() {
 		<-ctx.Done()
-		f.listener.Close()
+		f.plainLn.Close()
+		if f.rawTLS != nil {
+			f.rawTLS.Close()
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		f.srv.Shutdown(shutdownCtx)
+		f.plain.Shutdown(shutdownCtx)
+		if f.tlsSrv != nil {
+			f.tlsSrv.Shutdown(shutdownCtx)
+		}
 	}()
-	f.srv.Serve(f.listener)
+
+	var wg sync.WaitGroup
+	if f.tlsSrv != nil {
+		wg.Go(func() { f.tlsSrv.Serve(f.tlsLn) })
+	}
+	wg.Go(func() { f.plain.Serve(f.plainLn) })
+	wg.Wait()
 }
 
-// handle passes one tunneled stream to the HTTP server.
-func (f *fileServer) handle(stream transport.Stream, src string) {
+// handle passes one tunneled stream to whichever server owns its port.
+func (f *fileServer) handle(stream transport.Stream, port uint16, src string) {
 	// Clear the handshake deadline: it bounded the header exchange, and a
 	// download is allowed to take as long as it takes.
 	stream.SetDeadline(time.Time{})
-	f.listener.deliver(&streamConn{Stream: stream, port: f.port, src: src})
+	conn := &streamConn{Stream: stream, port: port, src: src}
+
+	if f.rawTLS != nil && port == 443 {
+		// Delivered raw: tls.NewListener wraps it on the way out of Accept, so
+		// the handshake happens inside the TLS listener rather than here.
+		f.rawTLS.deliver(conn)
+		return
+	}
+	f.plainLn.deliver(conn)
 }
 
 // loggingHandler records each request, so an operator can see what was fetched

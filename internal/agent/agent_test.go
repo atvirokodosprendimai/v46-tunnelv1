@@ -108,8 +108,18 @@ func TestServeDirAddsItsPort(t *testing.T) {
 	if !ag.allowed[portspec.Spec{Port: 8080, Proto: portspec.TCP}] {
 		t.Error("the served port was not published")
 	}
+	// The file server is built from the lease rather than in New, because with
+	// ACME the hostname to request a certificate for may be the server's to
+	// choose. Without a certificate the lease contributes nothing, but the
+	// construction point is the same one.
+	if err := ag.startFileServer(&proto.Lease{IP: "192.0.2.1"}); err != nil {
+		t.Fatalf("startFileServer: %v", err)
+	}
 	if ag.files == nil {
-		t.Error("no file server was built for ServeDir")
+		t.Fatal("no file server was built for ServeDir")
+	}
+	if !ag.files.serves(8080) {
+		t.Error("the file server does not answer on the served port")
 	}
 }
 

@@ -65,6 +65,10 @@ func main() {
 				Name:  "random-ip",
 				Usage: "lease a random free address instead of giving a reconnecting agent the one it had; anything caching a published address will break on reconnect",
 			},
+			&cli.StringFlag{
+				Name:  "zone",
+				Usage: "DNS zone to name agents under, e.g. tunnel.example.com; an agent that asks is told <agent>.<zone>. The server assigns the name only — it does not create the DNS record",
+			},
 		},
 		Action: run,
 	}
@@ -103,6 +107,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		Pool:      addrPool,
 		Auth:      server.StaticTokens(tokens),
 		DenyPorts: denyPorts,
+		Zone:      cmd.String("zone"),
 		Logger:    log,
 	})
 	if err != nil {

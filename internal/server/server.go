@@ -67,6 +67,15 @@ type Config struct {
 	DenyPorts []uint16
 	// Keepalive is how often the server pings an idle agent. Zero means 15s.
 	Keepalive time.Duration
+	// Zone, when set, is the DNS zone agents are named under: an agent that
+	// asks for a hostname is told "<agent-id>.<zone>".
+	//
+	// The server assigns the NAME and nothing else. It does not create the DNS
+	// record, because doing that needs provider credentials this program does
+	// not take — so the record pointing the name at the leased address stays
+	// the operator's job, and the lease reports both halves so external
+	// automation can make it.
+	Zone string
 	// Logger receives structured events. Defaults to slog.Default().
 	Logger *slog.Logger
 }
@@ -77,6 +86,7 @@ type Server struct {
 	auth      Authenticator
 	deny      map[uint16]bool
 	keepalive time.Duration
+	zone      string
 	log       *slog.Logger
 }
 
@@ -106,7 +116,20 @@ func New(cfg Config) (*Server, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{pool: cfg.Pool, auth: cfg.Auth, deny: deny, keepalive: keepalive, log: log}, nil
+	if cfg.Zone != "" {
+		if cfg.Pool.Mode() == pool.Random {
+			// A hostname is only useful with a DNS record behind it, and a
+			// random pool moves the address that record points at on every
+			// reconnect. Refusing at startup is the only place this can be
+			// caught: by the time a certificate fails, the cause looks like a
+			// CA problem.
+			return nil, errors.New("server: --zone and random address allocation are incompatible; a DNS record cannot follow an address that changes on reconnect")
+		}
+		if err := validateZone(cfg.Zone); err != nil {
+			return nil, err
+		}
+	}
+	return &Server{pool: cfg.Pool, auth: cfg.Auth, deny: deny, keepalive: keepalive, zone: cfg.Zone, log: log}, nil
 }
 
 // Serve accepts sessions until ctx is cancelled or the listener fails.
@@ -191,6 +214,8 @@ func (s *Server) handleSession(ctx context.Context, sess transport.Session) erro
 		Bound:        pub.boundSpecs(),
 		Refused:      refused,
 		KeepaliveSec: int(s.keepalive / time.Second),
+		Hostname:     s.hostnameFor(agentID, hello.WantHostname),
+		PoolMode:     s.pool.Mode().String(),
 	}}); err != nil {
 		return fmt.Errorf("sending lease: %w", err)
 	}

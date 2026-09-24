@@ -85,14 +85,8 @@ func TestNewRejects(t *testing.T) {
 func TestAcquireAndRelease(t *testing.T) {
 	p := mustNew(t, "192.0.2.1", "192.0.2.2")
 
-	a, err := p.Acquire("alice")
-	if err != nil {
-		t.Fatalf("Acquire(alice): %v", err)
-	}
-	b, err := p.Acquire("bob")
-	if err != nil {
-		t.Fatalf("Acquire(bob): %v", err)
-	}
+	a := acquireOne(t, p, "alice")
+	b := acquireOne(t, p, "bob")
 	if a == b {
 		t.Fatalf("two agents were leased the same address %v", a)
 	}
@@ -122,23 +116,15 @@ func TestAcquireAndRelease(t *testing.T) {
 func TestReconnectKeepsItsAddress(t *testing.T) {
 	p := mustNew(t, "192.0.2.1", "192.0.2.2", "192.0.2.3")
 
-	if _, err := p.Acquire("alice"); err != nil {
-		t.Fatalf("Acquire(alice): %v", err)
-	}
-	first, err := p.Acquire("laptop")
-	if err != nil {
-		t.Fatalf("Acquire(laptop): %v", err)
-	}
+	acquireOne(t, p, "alice")
+	first := acquireOne(t, p, "laptop")
 	if first.String() != "192.0.2.2" {
 		t.Fatalf("laptop was leased %v; this test needs it to hold the second address", first)
 	}
 	p.Release("alice")
 	p.Release("laptop")
 
-	again, err := p.Acquire("laptop")
-	if err != nil {
-		t.Fatalf("re-Acquire: %v", err)
-	}
+	again := acquireOne(t, p, "laptop")
 	if again != first {
 		t.Errorf("reconnect got %v, want its previous address %v", again, first)
 	}
@@ -149,25 +135,16 @@ func TestReconnectKeepsItsAddress(t *testing.T) {
 func TestStickyPreferenceYieldsWhenTaken(t *testing.T) {
 	p := mustNew(t, "192.0.2.1", "192.0.2.2")
 
-	first, err := p.Acquire("laptop")
-	if err != nil {
-		t.Fatalf("Acquire(laptop): %v", err)
-	}
+	first := acquireOne(t, p, "laptop")
 	p.Release("laptop")
 
 	// alice takes the first free address, which is the one laptop just gave up.
-	stolen, err := p.Acquire("alice")
-	if err != nil {
-		t.Fatalf("Acquire(alice): %v", err)
-	}
+	stolen := acquireOne(t, p, "alice")
 	if stolen != first {
 		t.Fatalf("alice was leased %v, want laptop's old address %v", stolen, first)
 	}
 
-	again, err := p.Acquire("laptop")
-	if err != nil {
-		t.Fatalf("Acquire when the preferred address is taken: %v", err)
-	}
+	again := acquireOne(t, p, "laptop")
 	if again == first {
 		t.Errorf("laptop was leased %v, which alice is holding", again)
 	}
@@ -180,14 +157,8 @@ func TestStickyPreferenceYieldsWhenTaken(t *testing.T) {
 // handed out two addresses, a flapping agent would drain the pool.
 func TestDoubleAcquireIsIdempotent(t *testing.T) {
 	p := mustNew(t, "192.0.2.1", "192.0.2.2", "192.0.2.3")
-	first, err := p.Acquire("flappy")
-	if err != nil {
-		t.Fatalf("Acquire: %v", err)
-	}
-	second, err := p.Acquire("flappy")
-	if err != nil {
-		t.Fatalf("second Acquire: %v", err)
-	}
+	first := acquireOne(t, p, "flappy")
+	second := acquireOne(t, p, "flappy")
 	if second != first {
 		t.Errorf("second Acquire returned %v, want the held address %v", second, first)
 	}
@@ -204,12 +175,12 @@ func TestConcurrentAcquireNeverDoubleLeases(t *testing.T) {
 	got := make([]netip.Addr, agents)
 	for i := range agents {
 		wg.Go(func() {
-			a, err := p.Acquire(string(rune('a'+i%26)) + string(rune('0'+i/26)))
+			addrs, err := p.Acquire(string(rune('a'+i%26)) + string(rune('0'+i/26)))
 			if err != nil {
 				t.Errorf("Acquire: %v", err)
 				return
 			}
-			got[i] = a
+			got[i] = addrs[0]
 		})
 	}
 	wg.Wait()

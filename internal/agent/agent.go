@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -188,7 +189,7 @@ func (a *Agent) Run(ctx context.Context, sess transport.Session) error {
 		return err
 	}
 	a.log.Info("published",
-		"ip", lease.IP,
+		"ip", strings.Join(leaseAddrs(lease), ","),
 		"ports", portspec.Format(lease.Bound),
 		"target", a.target)
 	for _, r := range lease.Refused {

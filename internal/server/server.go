@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -179,7 +180,7 @@ func (s *Server) handleSession(ctx context.Context, sess transport.Session) erro
 		return reject(control, ctl, reason, fmt.Errorf("protocol version mismatch: agent %d", hello.Version))
 	}
 
-	addr, err := s.pool.Acquire(agentID)
+	addrs, err := s.pool.Acquire(agentID)
 	if err != nil {
 		return reject(control, ctl, err.Error(), err)
 	}
@@ -192,9 +193,9 @@ func (s *Server) handleSession(ctx context.Context, sess transport.Session) erro
 
 	pub := &publication{
 		sess:    sess,
-		addr:    addr,
+		addrs:   addrs,
 		agentID: agentID,
-		log:     s.log.With("agent", agentID, "ip", addr.String()),
+		log:     s.log.With("agent", agentID, "ip", addrList(addrs)),
 		conduit: tunnel.NewConduit(sess, udpStream),
 	}
 	defer pub.close()
@@ -209,7 +210,8 @@ func (s *Server) handleSession(ctx context.Context, sess transport.Session) erro
 	}
 
 	if err := ctl.Send(proto.Control{Lease: &proto.Lease{
-		IP:           addr.String(),
+		IP:           addrs[0].String(),
+		IPs:          addrStrings(addrs),
 		AgentID:      agentID,
 		Bound:        pub.boundSpecs(),
 		Refused:      refused,
@@ -371,8 +373,11 @@ func (s *Server) runControl(ctx context.Context, ctl *proto.ControlConn) error {
 // publication is one agent's published address: its listeners, its UDP flows,
 // and the conduit carrying packets to it.
 type publication struct {
-	sess    transport.Session
-	addr    netip.Addr
+	sess transport.Session
+	// addrs are the leased addresses, at most one per family. Every declared
+	// port is bound on every one of them, so a dual-stack lease publishes the
+	// same service over IPv4 and IPv6.
+	addrs   []netip.Addr
 	agentID string
 	log     *slog.Logger
 	conduit *tunnel.Conduit
@@ -386,45 +391,80 @@ type publication struct {
 	flows flowTable
 }
 
-// bind opens a listener for every publishable spec. A port that will not bind
-// is reported as a refusal rather than failing the lease: the usual cause is
-// another agent's stale socket or a port in use on the host, and the agent's
-// other ports are still worth publishing.
+// bind opens a listener for every publishable spec on every leased address.
+//
+// A port that will not bind is reported as a refusal rather than failing the
+// lease: the usual cause is another agent's stale socket or a port in use on
+// the host, and the agent's other ports are still worth publishing. A spec is
+// refused only when it binds on NO leased address — succeeding on IPv6 while
+// IPv4 is taken still publishes the port, and reporting that as a refusal would
+// tell the agent a working port is dead.
 func (p *publication) bind(ctx context.Context, specs []portspec.Spec) []proto.Refusal {
 	var refusals []proto.Refusal
 	for _, spec := range specs {
-		hostPort := net.JoinHostPort(p.addr.String(), fmt.Sprint(spec.Port))
-		switch spec.Proto {
-		case portspec.TCP:
-			ln, err := net.Listen("tcp", hostPort)
-			if err != nil {
-				refusals = append(refusals, proto.Refusal{Spec: spec, Reason: bindReason(err)})
+		var lastErr error
+		bound := false
+		for _, addr := range p.addrs {
+			if err := p.bindOne(ctx, spec, addr); err != nil {
+				lastErr = err
 				continue
 			}
-			p.mu.Lock()
-			p.listeners = append(p.listeners, ln)
-			p.bound = append(p.bound, spec)
-			p.mu.Unlock()
-			go p.acceptTCP(ctx, ln, spec.Port)
-		case portspec.UDP:
-			udpAddr, err := net.ResolveUDPAddr("udp", hostPort)
-			if err != nil {
-				refusals = append(refusals, proto.Refusal{Spec: spec, Reason: bindReason(err)})
-				continue
-			}
-			conn, err := net.ListenUDP("udp", udpAddr)
-			if err != nil {
-				refusals = append(refusals, proto.Refusal{Spec: spec, Reason: bindReason(err)})
-				continue
-			}
-			p.mu.Lock()
-			p.packets = append(p.packets, conn)
-			p.bound = append(p.bound, spec)
-			p.mu.Unlock()
-			go p.readUDP(ctx, conn, spec.Port)
+			bound = true
 		}
+		if !bound {
+			refusals = append(refusals, proto.Refusal{Spec: spec, Reason: bindReason(lastErr)})
+			continue
+		}
+		p.mu.Lock()
+		p.bound = append(p.bound, spec)
+		p.mu.Unlock()
 	}
 	return refusals
+}
+
+// bindOne opens one listener for one spec on one address.
+func (p *publication) bindOne(ctx context.Context, spec portspec.Spec, addr netip.Addr) error {
+	hostPort := net.JoinHostPort(addr.String(), fmt.Sprint(spec.Port))
+	switch spec.Proto {
+	case portspec.UDP:
+		udpAddr, err := net.ResolveUDPAddr("udp", hostPort)
+		if err != nil {
+			return err
+		}
+		conn, err := net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			return err
+		}
+		p.mu.Lock()
+		p.packets = append(p.packets, conn)
+		p.mu.Unlock()
+		go p.readUDP(ctx, conn, spec.Port)
+		return nil
+	default:
+		ln, err := net.Listen("tcp", hostPort)
+		if err != nil {
+			return err
+		}
+		p.mu.Lock()
+		p.listeners = append(p.listeners, ln)
+		p.mu.Unlock()
+		go p.acceptTCP(ctx, ln, spec.Port)
+		return nil
+	}
+}
+
+// addrStrings renders leased addresses for the lease message.
+func addrStrings(addrs []netip.Addr) []string {
+	out := make([]string, len(addrs))
+	for i, a := range addrs {
+		out[i] = a.String()
+	}
+	return out
+}
+
+// addrList renders leased addresses for a log field.
+func addrList(addrs []netip.Addr) string {
+	return strings.Join(addrStrings(addrs), ",")
 }
 
 // bindReason renders a bind failure for the agent. The underlying error names

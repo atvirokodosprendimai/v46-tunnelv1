@@ -19,11 +19,7 @@ func TestRandomModeDoesNotKeepReturningOneAddress(t *testing.T) {
 
 	seen := make(map[netip.Addr]struct{})
 	for range 20 {
-		addr, err := p.Acquire("laptop")
-		if err != nil {
-			t.Fatalf("Acquire: %v", err)
-		}
-		seen[addr] = struct{}{}
+		seen[acquireOne(t, p, "laptop")] = struct{}{}
 		p.Release("laptop")
 	}
 	if len(seen) == 1 {
@@ -39,11 +35,7 @@ func TestStickyModeKeepsReturningOneAddress(t *testing.T) {
 
 	seen := make(map[netip.Addr]struct{})
 	for range 20 {
-		addr, err := p.Acquire("laptop")
-		if err != nil {
-			t.Fatalf("Acquire: %v", err)
-		}
-		seen[addr] = struct{}{}
+		seen[acquireOne(t, p, "laptop")] = struct{}{}
 		p.Release("laptop")
 	}
 	if len(seen) != 1 {
@@ -57,14 +49,8 @@ func TestStickyModeKeepsReturningOneAddress(t *testing.T) {
 func TestRandomModeDoubleAcquireIsIdempotent(t *testing.T) {
 	p := mustNewMode(t, Random, "192.0.2.1", "192.0.2.2", "192.0.2.3")
 
-	first, err := p.Acquire("flappy")
-	if err != nil {
-		t.Fatalf("Acquire: %v", err)
-	}
-	second, err := p.Acquire("flappy")
-	if err != nil {
-		t.Fatalf("second Acquire: %v", err)
-	}
+	first := acquireOne(t, p, "flappy")
+	second := acquireOne(t, p, "flappy")
 	if second != first {
 		t.Errorf("second Acquire returned %v, want the held address %v", second, first)
 	}
@@ -81,10 +67,7 @@ func TestRandomModeExhausts(t *testing.T) {
 
 	held := make(map[netip.Addr]string)
 	for _, agent := range []string{"a", "b"} {
-		addr, err := p.Acquire(agent)
-		if err != nil {
-			t.Fatalf("Acquire(%s): %v", agent, err)
-		}
+		addr := acquireOne(t, p, agent)
 		if prev, dup := held[addr]; dup {
 			t.Fatalf("address %v leased to both %s and %s", addr, prev, agent)
 		}
@@ -106,12 +89,12 @@ func TestRandomModeConcurrentAcquireNeverDoubleLeases(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := range agents {
 		wg.Go(func() {
-			addr, err := p.Acquire(agentName(i))
+			addrs, err := p.Acquire(agentName(i))
 			if err != nil {
 				t.Errorf("Acquire: %v", err)
 				return
 			}
-			got[i] = addr
+			got[i] = addrs[0]
 		})
 	}
 	wg.Wait()

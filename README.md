@@ -58,6 +58,87 @@ Either way, an agent that acquires twice without releasing (a reconnect racing
 its own dead session's cleanup) gets the same address back rather than a second
 one, so a flapping agent cannot drain the pool.
 
+### IPv4, IPv6, and dual-stack
+
+Either family works on its own — `--pool 2001:db8:1::/120` is a perfectly good
+pool, and every declared port is published on it.
+
+A pool holding **both** families leases **one address of each**, and every
+declared port is bound on both. That is what lets one hostname carry an A and an
+AAAA record reaching the same service:
+
+```sh
+tunneld --pool 198.51.100.0/24 --pool 2001:db8:1::/120 ...
+# agent logs: published ip=198.51.100.7,2001:db8:1::7 ports=443/tcp
+```
+
+Running out of one family does not deny the other: an agent still gets its IPv6
+lease when the IPv4 half is exhausted, because taking the whole agent offline
+over a shortage affecting half its addresses would be worse. Sticky leases are
+per family, so a reconnect gets **both** of its previous addresses back.
+
+The agent's `--target` is separate and unaffected — it is where the agent dials
+locally, and defaults to `127.0.0.1`. Pass `--target ::1` for a local service
+that only listens on IPv6.
+
+### HTTPS for a served directory
+
+`--domain` obtains a certificate and serves `--dir` over TLS:
+
+```sh
+tunnel-agent --server tunnel.example.com:4443 --token "$TOKEN" \
+             --dir ./release --domain files.example.com --acme-accept-tos
+```
+
+This publishes 80 and 443 automatically — issuance needs both reachable. The
+ACME HTTP-01 challenge arrives at the server on the leased address and is
+forwarded to the agent like any other traffic, which is what makes issuance work
+from behind a tunnel at all. Port 80 then redirects everything else to HTTPS.
+
+**The server needs permission to bind 80 and 443.** They are privileged ports,
+so `tunneld` must run as root or hold `CAP_NET_BIND_SERVICE`
+(`setcap cap_net_bind_service=+ep /usr/local/bin/tunneld`, or
+`AmbientCapabilities=CAP_NET_BIND_SERVICE` in a systemd unit). Without it the
+bind fails and the lease is refused with `no declared port could be bound` —
+which is the server telling you exactly this, not an ACME problem. The agent
+needs no privileges either way; it only dials.
+
+**You must create the DNS record yourself.** Nothing here writes DNS. The agent
+logs the exact records that have to exist, one per leased address:
+
+```
+dns_records_needed="files.example.com A 198.51.100.7; files.example.com AAAA 2001:db8:1::7"
+```
+
+Use `--acme-staging` while setting this up. Let's Encrypt's production rate
+limits are low enough to hit in one afternoon of debugging, and a staging
+certificate is untrusted but issued against far looser limits.
+
+`--acme-accept-tos` is required and has no default: accepting a certificate
+authority's subscriber agreement is a decision for a person, not for this
+program. `--acme-cache` (default: a per-user cache directory) holds the issued
+certificates and the ACME account key — losing it means re-issuing on every
+restart, which is how an agent walks into a rate limit.
+
+The certificate fronts the served directory and **nothing else**. For a
+forwarded port the tunnel carries raw bytes and whatever is behind it does its
+own TLS, so a certificate at the agent would have nothing to terminate.
+
+#### Server-assigned hostnames
+
+`tunneld --zone tunnel.example.com` names agents under a zone; an agent passing
+`--acme` instead of `--domain` is told `<agent-name>.tunnel.example.com` in its
+lease and requests a certificate for it.
+
+The server assigns the **name only** — it does not create DNS records, because
+that needs provider credentials this program does not take. The lease reports
+both the hostname and the addresses so external automation can make the records.
+
+`--zone` is refused alongside `--random-ip`: a hostname is only useful with a
+DNS record behind it, and random allocation moves the address that record points
+at on every reconnect. An explicitly passed `--domain` still reaches a random
+server, so the lease carries the pool mode and the agent warns.
+
 Agent:
 
 ```sh

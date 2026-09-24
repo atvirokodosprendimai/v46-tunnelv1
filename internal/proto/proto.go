@@ -80,7 +80,13 @@ type Refusal struct {
 // Lease is the server's answer: the address the agent was given, the ports it
 // actually bound there, and the ones it would not.
 type Lease struct {
-	IP           string          `json:"ip"`
+	// IP is the primary leased address, kept as a single value because most
+	// logs and messages want one name for the lease.
+	IP string `json:"ip"`
+	// IPs are every leased address, at most one per family. A dual-stack pool
+	// leases two, which is what lets one hostname carry both an A and an AAAA
+	// record; IP is the first of these.
+	IPs          []string        `json:"ips,omitempty"`
 	AgentID      string          `json:"agent_id"`
 	Bound        []portspec.Spec `json:"bound"`
 	Refused      []Refusal       `json:"refused,omitempty"`

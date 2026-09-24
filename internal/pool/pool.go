@@ -4,17 +4,12 @@
 // by the operator, or routed to it as a block. The pool only tracks which are
 // free, which keeps the server out of privileged netlink work and means a crash
 // leaves no half-configured interface behind.
-//
-// Leases are sticky: an agent that reconnects gets the address it had before,
-// while it is still free. That is not a convenience. Everything pointed at a
-// published address caches it — DNS records, firewall rules, a client's config
-// file — so an address that changes on every reconnect quietly breaks all of
-// them.
 package pool
 
 import (
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net/netip"
 	"sync"
 )
@@ -28,27 +23,68 @@ const MaxAddresses = 65536
 // ErrExhausted reports that every address in the pool is leased.
 var ErrExhausted = errors.New("pool: no free addresses")
 
+// Mode says how a free address is chosen for an agent.
+type Mode int
+
+const (
+	// Sticky gives a reconnecting agent the address it held last, while that
+	// address is still free.
+	//
+	// This is the default because everything pointed at a published address
+	// caches it — DNS records, firewall rules, a client's config file — so an
+	// address that changes on every reconnect quietly breaks callers that are
+	// doing nothing wrong.
+	Sticky Mode = iota
+
+	// Random chooses uniformly among the free addresses and remembers nothing,
+	// so a reconnecting agent generally lands somewhere new.
+	//
+	// It is the right choice when rotation is the point — cycling an address's
+	// reputation, or keeping an agent's address from being a stable identifier
+	// — and the wrong one for anything long-lived, for the reason Sticky names.
+	Random
+)
+
+// String names the mode for logs.
+func (m Mode) String() string {
+	if m == Random {
+		return "random"
+	}
+	return "sticky"
+}
+
 // Pool is a set of addresses and the leases held on them. It is safe for
 // concurrent use.
 type Pool struct {
-	mu sync.Mutex
-	// all preserves configuration order, so allocation is predictable and an
-	// operator reading the logs sees addresses handed out in the order they
-	// wrote them.
+	mu   sync.Mutex
+	mode Mode
+	// all preserves configuration order, so Sticky allocation is predictable
+	// and an operator reading the logs sees addresses handed out in the order
+	// they wrote them.
 	all []netip.Addr
 	// holder maps a leased address to the agent holding it.
 	holder map[netip.Addr]string
+	// held maps an agent to the address it currently holds. It is what makes a
+	// repeated Acquire idempotent in both modes, and Release a lookup rather
+	// than a scan.
+	held map[string]netip.Addr
 	// sticky remembers the last address each agent held, including after the
 	// lease is released. It is the memory that makes a reconnect keep its
-	// address; it is deliberately never pruned, because an agent that
-	// disconnects overnight is exactly the case it exists for.
+	// address, and it is deliberately never pruned, because an agent that
+	// disconnects overnight is exactly the case it exists for. Unused in
+	// Random mode, which is the whole of what Random means.
 	sticky map[string]netip.Addr
 }
 
 // New builds a pool from a list of addresses and CIDR prefixes, in the order
 // given. A bare address is taken literally; a prefix is expanded.
-func New(entries []string) (*Pool, error) {
-	p := &Pool{holder: make(map[netip.Addr]string), sticky: make(map[string]netip.Addr)}
+func New(entries []string, mode Mode) (*Pool, error) {
+	p := &Pool{
+		mode:   mode,
+		holder: make(map[netip.Addr]string),
+		held:   make(map[string]netip.Addr),
+		sticky: make(map[string]netip.Addr),
+	}
 	seen := make(map[netip.Addr]struct{})
 	for _, entry := range entries {
 		addrs, err := expand(entry)
@@ -72,6 +108,9 @@ func New(entries []string) (*Pool, error) {
 	return p, nil
 }
 
+// Mode reports how this pool allocates.
+func (p *Pool) Mode() Mode { return p.mode }
+
 // Size reports how many addresses the pool holds.
 func (p *Pool) Size() int { return len(p.all) }
 
@@ -82,43 +121,83 @@ func (p *Pool) Free() int {
 	return len(p.all) - len(p.holder)
 }
 
-// Acquire leases an address to agentID, preferring the one it held last.
+// Acquire leases an address to agentID.
 //
 // An agent that acquires twice without releasing — a reconnect racing its own
 // dead session's cleanup — gets the same address back rather than a second one,
-// so a flapping agent cannot drain the pool.
+// in either mode, so a flapping agent cannot drain the pool.
 func (p *Pool) Acquire(agentID string) (netip.Addr, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if want, ok := p.sticky[agentID]; ok {
-		if holder, leased := p.holder[want]; !leased || holder == agentID {
-			p.holder[want] = agentID
-			return want, nil
+	if current, ok := p.held[agentID]; ok {
+		return current, nil
+	}
+	if p.mode == Sticky {
+		if want, ok := p.sticky[agentID]; ok {
+			if _, leased := p.holder[want]; !leased {
+				p.take(want, agentID)
+				return want, nil
+			}
 		}
 	}
-	for _, a := range p.all {
-		if _, leased := p.holder[a]; leased {
-			continue
-		}
-		p.holder[a] = agentID
-		p.sticky[agentID] = a
-		return a, nil
+
+	addr, ok := p.pickFree()
+	if !ok {
+		return netip.Addr{}, ErrExhausted
 	}
-	return netip.Addr{}, ErrExhausted
+	p.take(addr, agentID)
+	return addr, nil
 }
 
-// Release returns agentID's address to the pool. The sticky preference is kept,
-// so a later reconnect still lands on the same address. Releasing an agent that
-// holds nothing is a no-op.
+// pickFree chooses an unleased address according to the pool's mode. The caller
+// holds the lock.
+func (p *Pool) pickFree() (netip.Addr, bool) {
+	if p.mode == Random {
+		// Reservoir sampling over the free addresses: one pass, no allocation,
+		// and uniform without needing to know the count in advance.
+		var chosen netip.Addr
+		seen := 0
+		for _, a := range p.all {
+			if _, leased := p.holder[a]; leased {
+				continue
+			}
+			seen++
+			if rand.IntN(seen) == 0 {
+				chosen = a
+			}
+		}
+		return chosen, seen > 0
+	}
+	for _, a := range p.all {
+		if _, leased := p.holder[a]; !leased {
+			return a, true
+		}
+	}
+	return netip.Addr{}, false
+}
+
+// take records a lease. The caller holds the lock.
+func (p *Pool) take(addr netip.Addr, agentID string) {
+	p.holder[addr] = agentID
+	p.held[agentID] = addr
+	if p.mode == Sticky {
+		p.sticky[agentID] = addr
+	}
+}
+
+// Release returns agentID's address to the pool. In Sticky mode the preference
+// is kept, so a later reconnect still lands on the same address. Releasing an
+// agent that holds nothing is a no-op.
 func (p *Pool) Release(agentID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for addr, holder := range p.holder {
-		if holder == agentID {
-			delete(p.holder, addr)
-		}
+	addr, ok := p.held[agentID]
+	if !ok {
+		return
 	}
+	delete(p.held, agentID)
+	delete(p.holder, addr)
 }
 
 // Holder reports which agent holds addr, if any.

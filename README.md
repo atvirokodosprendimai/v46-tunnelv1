@@ -40,6 +40,24 @@ configure interfaces, so a crash leaves nothing half-configured behind.
 `tokens` is one `<token> <agent-name>` per line. The name is what the sticky
 lease is keyed on.
 
+### Sticky or random addresses
+
+By default a reconnecting agent gets the address it had before. That is not a
+convenience: everything pointed at a published address caches it — DNS records,
+firewall allowlists, a client's config file — so an address that changes on
+every reconnect breaks callers that are doing nothing wrong.
+
+`--random-ip` allocates uniformly among the free addresses and remembers
+nothing, so an agent generally lands somewhere new. Reach for it when rotation
+is the point — cycling an address's reputation, or keeping an agent's address
+from being a stable identifier — and not for anything long-lived. The startup
+log prints `pool_mode=sticky` or `pool_mode=random` so you can confirm which is
+in effect.
+
+Either way, an agent that acquires twice without releasing (a reconnect racing
+its own dead session's cleanup) gets the same address back rather than a second
+one, so a flapping agent cannot drain the pool.
+
 Agent:
 
 ```sh

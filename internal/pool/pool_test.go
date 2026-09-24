@@ -10,9 +10,14 @@ import (
 
 func mustNew(t *testing.T, entries ...string) *Pool {
 	t.Helper()
-	p, err := New(entries)
+	return mustNewMode(t, Sticky, entries...)
+}
+
+func mustNewMode(t *testing.T, mode Mode, entries ...string) *Pool {
+	t.Helper()
+	p, err := New(entries, mode)
 	if err != nil {
-		t.Fatalf("New(%v): %v", entries, err)
+		t.Fatalf("New(%v, %v): %v", entries, mode, err)
 	}
 	return p
 }
@@ -66,7 +71,7 @@ func TestNewRejects(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := New(tt.entries)
+			_, err := New(tt.entries, Sticky)
 			if err == nil {
 				t.Fatalf("New(%v) succeeded, want an error", tt.entries)
 			}

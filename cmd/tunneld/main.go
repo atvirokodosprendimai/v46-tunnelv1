@@ -61,6 +61,10 @@ func main() {
 				Name:  "no-wss",
 				Usage: "serve QUIC only, without the WebSocket fallback",
 			},
+			&cli.BoolFlag{
+				Name:  "random-ip",
+				Usage: "lease a random free address instead of giving a reconnecting agent the one it had; anything caching a published address will break on reconnect",
+			},
 		},
 		Action: run,
 	}
@@ -77,7 +81,7 @@ func main() {
 func run(ctx context.Context, cmd *cli.Command) error {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	addrPool, err := pool.New(cmd.StringSlice("pool"))
+	addrPool, err := pool.New(cmd.StringSlice("pool"), poolMode(cmd.Bool("random-ip")))
 	if err != nil {
 		return err
 	}
@@ -115,6 +119,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	log.Info("listening",
 		"quic", quicLn.Addr().String(),
 		"pool_size", addrPool.Size(),
+		"pool_mode", addrPool.Mode().String(),
 		"agents", len(tokens),
 		"denied_ports", denyList(denyPorts))
 
@@ -222,6 +227,16 @@ func parseDenyPorts(values []string) ([]uint16, error) {
 		}
 	}
 	return out, nil
+}
+
+// poolMode turns the --random-ip flag into an allocation mode. Sticky is the
+// default because a published address is cached by whatever points at it, so
+// changing it on reconnect breaks callers that did nothing wrong.
+func poolMode(random bool) pool.Mode {
+	if random {
+		return pool.Random
+	}
+	return pool.Sticky
 }
 
 // denyList renders the effective deny list for the startup log, so an operator

@@ -65,7 +65,7 @@ func startServerOn(t *testing.T, denyPorts []uint16, kind string) *harness {
 	if err != nil {
 		t.Fatalf("SelfSigned: %v", err)
 	}
-	addrPool, err := pool.New([]string{leaseIP})
+	addrPool, err := pool.New([]string{leaseIP}, pool.Sticky)
 	if err != nil {
 		t.Fatalf("pool.New: %v", err)
 	}

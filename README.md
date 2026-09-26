@@ -124,20 +124,100 @@ The certificate fronts the served directory and **nothing else**. For a
 forwarded port the tunnel carries raw bytes and whatever is behind it does its
 own TLS, so a certificate at the agent would have nothing to terminate.
 
-#### Server-assigned hostnames
+### Parked domain, random subdomains, and a built-in nameserver
 
-`tunneld --zone tunnel.example.com` names agents under a zone; an agent passing
-`--acme` instead of `--domain` is told `<agent-name>.tunnel.example.com` in its
-lease and requests a certificate for it.
+`--domain` makes the server authoritative for a zone. Every agent that connects
+is given a **random 24-character subdomain** resolving to its own leased
+addresses, served by a nameserver built into `tunneld`:
 
-The server assigns the **name only** — it does not create DNS records, because
-that needs provider credentials this program does not take. The lease reports
-both the hostname and the addresses so external automation can make the records.
+```sh
+tunneld --domain tun.example.com \
+        --dns-listen :53 --dns-ns ns1.tun.example.com \
+        --pool 198.51.100.0/24 --tokens /etc/tunneld/tokens ...
 
-`--zone` is refused alongside `--random-ip`: a hostname is only useful with a
-DNS record behind it, and random allocation moves the address that record points
-at on every reconnect. An explicitly passed `--domain` still reaches a random
-server, so the lease carries the pool mode and the agent warns.
+# agent logs: published ip=198.51.100.7 hostname=lxzb3hkpwj6s6oxwvtsvadhi.tun.example.com
+```
+
+Delegate the zone at the parent — `tun.example.com NS ns1.tun.example.com`,
+with `ns1` pointing at this host — and the names resolve. There are no records
+to create per agent: the nameserver answers from the live lease table, so a name
+points at whatever address that agent holds right now and stops resolving the
+moment its session ends.
+
+The label is random rather than derived from the agent's name. A derived name
+leaks who is connected to anyone who can guess it, and collides the moment two
+operators pick the same agent name. It is fresh on every reconnect.
+
+With a pool of several addresses, each subdomain resolves to its own agent's
+address — that is what makes this a real-IP tunnel rather than SNI-based
+demultiplexing onto one address.
+
+**Port 53 is privileged** (`CAP_NET_BIND_SERVICE` or root), same as 80/443.
+
+#### The nameserver is deliberately not a general one
+
+It does not recurse, does not cache, and serves no zone file. A public
+authoritative nameserver is a reflection and amplification vector, so:
+
+- recursion is never advertised
+- `ANY` is answered minimally (RFC 8482) rather than with everything known
+- queries are rate limited per source (`--dns-qps`), and over the limit the
+  server goes **silent** rather than refusing — a refusal is still a packet sent
+  to whatever address the query claimed to come from, which is the reflection
+  being prevented
+
+### Wildcard certificate and terminated HTTPS
+
+`--wildcard-cert` obtains `*.<domain>` from a CA over ACME **DNS-01**, answered
+by the built-in nameserver — which is the only challenge type that can issue a
+wildcard at all, and the reason running your own zone is worth it:
+
+```sh
+tunneld --domain tun.example.com --wildcard-cert --acme-accept-tos \
+        --acme-email you@example.com ...
+
+tunnel-agent --server tunnel.example.com:4443 --token "$TOKEN" \
+             --dir ./release --https
+```
+
+The agent's subdomain then serves HTTPS with no certificate for the agent to
+obtain or renew, however often it reconnects and however many agents there are:
+one wildcard covers them all.
+
+**⚠ On this path the tunnel is not a raw byte pipe.** The server holds the key
+and decrypts, so it sees the plaintext of every request served this way. That is
+inherent to terminating at the server rather than at the agent, and it is why it
+is opt-in per agent (`--https` / `--https-backend <port>`) instead of applied to
+port 443 for everyone. **Your forwarded ports are unaffected** — the server
+still moves opaque bytes on those and cannot read them.
+
+Use `--acme-staging` while getting delegation right; a wildcard order that fails
+because the zone is not delegated yet is easy to retry into a production rate
+limit.
+
+`--https-port` moves termination off 443 for a deployment behind a load balancer
+or one running unprivileged.
+
+Refusals here cost the agent port 443 alone and never its lease. An agent that
+also declared `443/tcp` itself is refused termination — the two mean opposite
+things for the same listener — and keeps every other port it named.
+
+#### Bring your own certificate instead
+
+An agent can still obtain its **own** certificate for the server-assigned
+hostname rather than using the server's wildcard, with `--acme` and
+`--acme-accept-tos`. It uses HTTP-01 through the tunnel, so it needs 80 and 443
+published, and the private key never leaves the agent — at the cost of an
+issuance per agent and the rate limits that implies. `--https-backend` and
+`--acme`/`--domain` are mutually exclusive: both terminate TLS, in different
+places.
+
+#### A note on the two `--domain` flags
+
+`tunneld --domain` is the zone the **server** is authoritative for.
+`tunnel-agent --domain` is a hostname **you** already own and point at the
+agent's leased address yourself. They are different jobs on different binaries;
+the agent's is for the bring-your-own-domain case above.
 
 Agent:
 
@@ -217,6 +297,9 @@ This publishes an agent's localhost on a public address. Be deliberate about it.
 | `internal/server` | listeners on the leased address, UDP flow table |
 | `internal/agent` | local dialing, the served directory |
 | `internal/tunnel` | the UDP conduit and the connection splice |
+| `internal/subdomain` | random labels and the live label→agent registry |
+| `internal/dnsd` | the authoritative nameserver and its rate limiter |
+| `internal/wildcard` | the wildcard certificate: ACME DNS-01, renewal, cache |
 | `internal/e2e` | a real server and agent over a real session |
 
 ## Tests

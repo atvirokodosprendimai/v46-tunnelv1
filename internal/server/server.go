@@ -78,6 +78,12 @@ type Config struct {
 	// right now. That is why random address allocation is compatible with a
 	// domain, where an externally managed record would not be.
 	Domain string
+	// Certs supplies the wildcard certificate for terminated HTTPS. Optional;
+	// without it an agent asking for termination is refused that one port and
+	// keeps the rest of its lease.
+	Certs CertificateSource
+	// HTTPSPort is where terminated TLS is bound. Zero means DefaultHTTPSPort.
+	HTTPSPort uint16
 	// Registry holds the live subdomain bindings the nameserver answers from.
 	// Required when Domain is set.
 	Registry *subdomain.Registry
@@ -93,6 +99,8 @@ type Server struct {
 	keepalive time.Duration
 	domain    string
 	registry  *subdomain.Registry
+	certs     CertificateSource
+	httpsPort uint16
 	log       *slog.Logger
 }
 
@@ -122,6 +130,10 @@ func New(cfg Config) (*Server, error) {
 	if log == nil {
 		log = slog.Default()
 	}
+	httpsPort := cfg.HTTPSPort
+	if httpsPort == 0 {
+		httpsPort = DefaultHTTPSPort
+	}
 	if cfg.Domain != "" {
 		if err := validateDomain(cfg.Domain); err != nil {
 			return nil, err
@@ -137,6 +149,8 @@ func New(cfg Config) (*Server, error) {
 		keepalive: keepalive,
 		domain:    cfg.Domain,
 		registry:  cfg.Registry,
+		certs:     cfg.Certs,
+		httpsPort: httpsPort,
 		log:       log,
 	}, nil
 }
@@ -218,6 +232,12 @@ func (s *Server) handleSession(ctx context.Context, sess transport.Session) erro
 	defer pub.close()
 
 	refused = append(refused, pub.bind(ctx, bound)...)
+
+	// Terminated HTTPS is bound after the declared ports, so a conflict on 443
+	// is reported against the agent's own declaration rather than against a
+	// port it never asked for.
+	https, httpsRefusals := s.setUpHTTPS(ctx, pub, hello, hostname, bound)
+	refused = append(refused, httpsRefusals...)
 	// Screening passed at least one port, but binding can still refuse them
 	// all — a port already in use on the host, or a stale socket from a session
 	// that has not finished dying. A lease carrying no listeners is worse than
@@ -235,6 +255,7 @@ func (s *Server) handleSession(ctx context.Context, sess transport.Session) erro
 		KeepaliveSec: int(s.keepalive / time.Second),
 		Hostname:     hostname,
 		PoolMode:     s.pool.Mode().String(),
+		HTTPS:        https,
 	}}); err != nil {
 		return fmt.Errorf("sending lease: %w", err)
 	}

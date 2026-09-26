@@ -84,6 +84,35 @@ func main() {
 				Value: 0,
 				Usage: "per-source query allowance for the nameserver (0 uses the default). A public authoritative server is an amplification vector; this is what makes it useless for that",
 			},
+			&cli.BoolFlag{
+				Name:  "wildcard-cert",
+				Usage: "obtain a wildcard certificate for --domain via ACME DNS-01, answered by the built-in nameserver, and terminate TLS on 443 for agents that ask",
+			},
+			&cli.UintFlag{
+				Name:  "https-port",
+				Value: 443,
+				Usage: "port to terminate TLS on for agent subdomains. 443 is privileged; a deployment behind a load balancer, or one running unprivileged, sets a high port here",
+			},
+			&cli.BoolFlag{
+				Name:  "acme-accept-tos",
+				Usage: "accept the certificate authority's subscriber agreement; required with --wildcard-cert",
+			},
+			&cli.StringFlag{
+				Name:  "acme-directory",
+				Usage: "ACME endpoint (default: Let's Encrypt production)",
+			},
+			&cli.BoolFlag{
+				Name:  "acme-staging",
+				Usage: "shorthand for --acme-directory pointing at Let's Encrypt staging; use it while getting delegation right",
+			},
+			&cli.StringFlag{
+				Name:  "acme-cache",
+				Usage: "directory for the wildcard certificate and the ACME account key (default: a per-user cache directory)",
+			},
+			&cli.StringFlag{
+				Name:  "acme-email",
+				Usage: "contact address the CA uses for expiry warnings",
+			},
 		},
 		Action: run,
 	}
@@ -124,23 +153,29 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		registry = subdomain.NewRegistry(domain)
 	}
 
+	// Order matters: the nameserver answers from the registry, the wildcard
+	// certificate is validated through the nameserver, and the server needs the
+	// certificate before an agent can ask it to terminate TLS.
+	if registry != nil {
+		if err := startDNS(ctx, cmd, registry, log); err != nil {
+			return err
+		}
+	}
+	certs, err := startWildcard(ctx, cmd, registry, log)
+	if err != nil {
+		return err
+	}
+
 	srv, err := server.New(server.Config{
 		Pool:      addrPool,
 		Auth:      server.StaticTokens(tokens),
 		DenyPorts: denyPorts,
 		Domain:    domain,
 		Registry:  registry,
+		Certs:     certsOrNil(certs),
+		HTTPSPort: uint16(cmd.Uint("https-port")),
 		Logger:    log,
 	})
-	if err != nil {
-		return err
-	}
-
-	if registry != nil {
-		if err := startDNS(ctx, cmd, registry, log); err != nil {
-			return err
-		}
-	}
 	if err != nil {
 		return err
 	}

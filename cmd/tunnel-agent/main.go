@@ -44,6 +44,14 @@ func main() {
 				Value: 8080,
 				Usage: "published port for --dir; added to --ports automatically, and ignored when a certificate is requested (that moves --dir to 80 and 443)",
 			},
+			&cli.UintFlag{
+				Name:  "https-backend",
+				Usage: "ask the server to terminate TLS on 443 for your assigned subdomain and forward the plaintext to this local port. With --dir and no port given, the directory is used. ⚠ The server decrypts, so it sees the plaintext",
+			},
+			&cli.BoolFlag{
+				Name:  "https",
+				Usage: "shorthand for --https-backend pointing at --dir",
+			},
 			&cli.StringFlag{
 				Name:  "domain",
 				Usage: "obtain a certificate for this hostname and serve --dir over TLS; you must point its DNS record at the leased address yourself",
@@ -138,15 +146,25 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		return err
 	}
 
+	httpsBackend, err := httpsBackendFrom(cmd, uint16(dirPort), serveDir)
+	if err != nil {
+		return err
+	}
+	if httpsBackend != 0 {
+		log.Warn("the server will terminate TLS for this agent, so it can read the plaintext of everything served on 443; forwarded ports stay opaque to it",
+			"backend_port", httpsBackend)
+	}
+
 	ag, err := agent.New(agent.Config{
-		Server:    server,
-		Token:     cmd.String("token"),
-		Ports:     ports,
-		Target:    cmd.String("target"),
-		ServeDir:  serveDir,
-		ServePort: uint16(dirPort),
-		ACME:      acmeConf,
-		Logger:    log,
+		Server:       server,
+		Token:        cmd.String("token"),
+		Ports:        ports,
+		Target:       cmd.String("target"),
+		ServeDir:     serveDir,
+		ServePort:    uint16(dirPort),
+		ACME:         acmeConf,
+		HTTPSBackend: httpsBackend,
+		Logger:       log,
 	})
 	if err != nil {
 		return err

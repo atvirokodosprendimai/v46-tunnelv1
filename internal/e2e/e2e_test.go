@@ -27,6 +27,7 @@ import (
 	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/agent"
 	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/pool"
 	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/portspec"
+	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/proto"
 	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/server"
 	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/tlsutil"
 	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/transport"
@@ -224,6 +225,28 @@ func (h *harness) connect(t *testing.T, cfg agent.Config) {
 			t.Error("agent did not stop within 5s of its context being cancelled")
 		}
 	})
+}
+
+// connectLease runs an agent and returns the lease the server granted, so a
+// test can assert on what was bound and what was refused.
+func (h *harness) connectLease(t *testing.T, cfg agent.Config) *proto.Lease {
+	t.Helper()
+	leases := make(chan *proto.Lease, 1)
+	cfg.OnLease = func(l *proto.Lease) {
+		select {
+		case leases <- l:
+		default:
+		}
+	}
+	h.connect(t, cfg)
+
+	select {
+	case lease := <-leases:
+		return lease
+	case <-time.After(15 * time.Second):
+		t.Fatal("no lease arrived within 15s")
+		return nil
+	}
 }
 
 // freeTCPListener returns a listener on the loopback and the port it holds, so

@@ -57,6 +57,20 @@ type Config struct {
 	ServePort uint16
 	// ACME, when enabled, obtains a certificate and serves ServeDir over TLS.
 	ACME ACMEConfig
+	// HTTPSBackend, when non-zero, asks the server to terminate TLS on 443 for
+	// this agent's assigned subdomain and forward the plaintext to this local
+	// port.
+	//
+	// ⚠ The server decrypts, so it sees the plaintext of everything served this
+	// way. That is the trade for a certificate nobody has to obtain or renew;
+	// the forwarded ports are unaffected and stay opaque to the server.
+	HTTPSBackend uint16
+	// OnLease, when set, is called once with the lease the server granted.
+	//
+	// It exists because the lease carries facts an embedder needs and cannot
+	// get anywhere else — the assigned hostname, the leased addresses, which
+	// ports were refused and why — and a log line is not an interface.
+	OnLease func(*proto.Lease)
 	// Logger receives structured events. Defaults to slog.Default().
 	Logger *slog.Logger
 }
@@ -89,6 +103,13 @@ func New(cfg Config) (*Agent, error) {
 	}
 	if err := cfg.ACME.validate(cfg.ServeDir); err != nil {
 		return nil, err
+	}
+	if cfg.HTTPSBackend != 0 && cfg.ACME.enabled() {
+		// Both terminate TLS on 443, one at the server and one here. Running
+		// both would have the agent request a certificate for a port the server
+		// is already answering, and the agent's issuance would fail in a way
+		// that names neither flag.
+		return nil, errors.New("agent: --https-backend and --domain/--acme both terminate TLS; use --https-backend to let the server do it, or --domain to do it here")
 	}
 	if cfg.ServeDir != "" {
 		info, err := os.Stat(cfg.ServeDir)
@@ -180,6 +201,7 @@ func (a *Agent) Run(ctx context.Context, sess transport.Session) error {
 		Ports:        a.cfg.Ports,
 		Domain:       a.cfg.ACME.Domain,
 		WantHostname: a.cfg.ACME.UseServerHostname,
+		HTTPSBackend: a.cfg.HTTPSBackend,
 	}}); err != nil {
 		return fmt.Errorf("sending hello: %w", err)
 	}
@@ -203,6 +225,10 @@ func (a *Agent) Run(ctx context.Context, sess transport.Session) error {
 	a.log.Info("published", published...)
 	for _, r := range lease.Refused {
 		a.log.Warn("port not published", "port", r.Spec.String(), "reason", r.Reason)
+	}
+
+	if a.cfg.OnLease != nil {
+		a.cfg.OnLease(lease)
 	}
 
 	if err := a.startFileServer(lease); err != nil {

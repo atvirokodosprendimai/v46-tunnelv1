@@ -67,6 +67,15 @@ type Hello struct {
 	// separate from Domain because the agent has to declare the ACME ports
 	// before it knows what the server will call it.
 	WantHostname bool `json:"want_hostname,omitempty"`
+	// HTTPSBackend, when non-zero, asks the server to terminate TLS on 443 for
+	// this agent's subdomain and forward the decrypted stream to this local
+	// port.
+	//
+	// ⚠ This is the one path where the tunnel is not a raw byte pipe. The
+	// server holds the key and decrypts, so it sees the plaintext of every
+	// request — unavoidable when it terminates, and the reason it is opt-in per
+	// agent rather than applied to port 443 generally.
+	HTTPSBackend uint16 `json:"https_backend,omitempty"`
 }
 
 // Refusal explains why one declared port was not published. A refusal is
@@ -100,6 +109,11 @@ type Lease struct {
 	// The agent needs it to warn that a certificate on a domain is pointless
 	// against a server that will move the address on the next reconnect.
 	PoolMode string `json:"pool_mode,omitempty"`
+	// HTTPS reports that the server is terminating TLS on 443 for this agent's
+	// hostname. It is the confirmation that the request was honoured, which an
+	// agent cannot infer: asking is not the same as the server having a
+	// certificate to serve.
+	HTTPS bool `json:"https,omitempty"`
 }
 
 // Error is a terminal control message: the session is over and this is why.

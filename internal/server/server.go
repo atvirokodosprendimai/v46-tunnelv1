@@ -21,6 +21,7 @@ import (
 	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/pool"
 	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/portspec"
 	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/proto"
+	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/subdomain"
 	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/transport"
 	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/tunnel"
 )
@@ -68,15 +69,18 @@ type Config struct {
 	DenyPorts []uint16
 	// Keepalive is how often the server pings an idle agent. Zero means 15s.
 	Keepalive time.Duration
-	// Zone, when set, is the DNS zone agents are named under: an agent that
-	// asks for a hostname is told "<agent-id>.<zone>".
+	// Domain, when set, is the DNS zone this server is authoritative for.
+	// Every agent is given a random subdomain under it, reported in the lease.
 	//
-	// The server assigns the NAME and nothing else. It does not create the DNS
-	// record, because doing that needs provider credentials this program does
-	// not take — so the record pointing the name at the leased address stays
-	// the operator's job, and the lease reports both halves so external
-	// automation can make it.
-	Zone string
+	// Unlike an operator-managed record, this one cannot go stale: the
+	// nameserver answers from the live registry, so a name stops resolving the
+	// moment its session ends and always points at the address the agent holds
+	// right now. That is why random address allocation is compatible with a
+	// domain, where an externally managed record would not be.
+	Domain string
+	// Registry holds the live subdomain bindings the nameserver answers from.
+	// Required when Domain is set.
+	Registry *subdomain.Registry
 	// Logger receives structured events. Defaults to slog.Default().
 	Logger *slog.Logger
 }
@@ -87,7 +91,8 @@ type Server struct {
 	auth      Authenticator
 	deny      map[uint16]bool
 	keepalive time.Duration
-	zone      string
+	domain    string
+	registry  *subdomain.Registry
 	log       *slog.Logger
 }
 
@@ -117,20 +122,23 @@ func New(cfg Config) (*Server, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	if cfg.Zone != "" {
-		if cfg.Pool.Mode() == pool.Random {
-			// A hostname is only useful with a DNS record behind it, and a
-			// random pool moves the address that record points at on every
-			// reconnect. Refusing at startup is the only place this can be
-			// caught: by the time a certificate fails, the cause looks like a
-			// CA problem.
-			return nil, errors.New("server: --zone and random address allocation are incompatible; a DNS record cannot follow an address that changes on reconnect")
-		}
-		if err := validateZone(cfg.Zone); err != nil {
+	if cfg.Domain != "" {
+		if err := validateDomain(cfg.Domain); err != nil {
 			return nil, err
 		}
+		if cfg.Registry == nil {
+			return nil, errors.New("server: a domain needs a subdomain registry for the nameserver to answer from")
+		}
 	}
-	return &Server{pool: cfg.Pool, auth: cfg.Auth, deny: deny, keepalive: keepalive, zone: cfg.Zone, log: log}, nil
+	return &Server{
+		pool:      cfg.Pool,
+		auth:      cfg.Auth,
+		deny:      deny,
+		keepalive: keepalive,
+		domain:    cfg.Domain,
+		registry:  cfg.Registry,
+		log:       log,
+	}, nil
 }
 
 // Serve accepts sessions until ctx is cancelled or the listener fails.
@@ -186,6 +194,15 @@ func (s *Server) handleSession(ctx context.Context, sess transport.Session) erro
 	}
 	defer s.pool.Release(agentID)
 
+	// The subdomain is bound before the ports so the lease can report it, and
+	// released with the session so the name stops resolving the moment the
+	// tunnel ends rather than when a cache happens to expire.
+	hostname, err := s.bindSubdomain(agentID, addrs)
+	if err != nil {
+		return reject(control, ctl, err.Error(), err)
+	}
+	defer s.releaseSubdomain(agentID)
+
 	bound, refused := s.screenPorts(hello.Ports)
 	if len(bound) == 0 {
 		return reject(control, ctl, "every declared port was refused", errors.New("no publishable ports declared"))
@@ -216,7 +233,7 @@ func (s *Server) handleSession(ctx context.Context, sess transport.Session) erro
 		Bound:        pub.boundSpecs(),
 		Refused:      refused,
 		KeepaliveSec: int(s.keepalive / time.Second),
-		Hostname:     s.hostnameFor(agentID, hello.WantHostname),
+		Hostname:     hostname,
 		PoolMode:     s.pool.Mode().String(),
 	}}); err != nil {
 		return fmt.Errorf("sending lease: %w", err)

@@ -21,6 +21,7 @@ import (
 
 	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/pool"
 	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/server"
+	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/subdomain"
 	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/tlsutil"
 	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/transport"
 	"github.com/atvirokodosprendimai/v46-tunnelv1/internal/transport/quictp"
@@ -66,8 +67,22 @@ func main() {
 				Usage: "lease a random free address instead of giving a reconnecting agent the one it had; anything caching a published address will break on reconnect",
 			},
 			&cli.StringFlag{
-				Name:  "zone",
-				Usage: "DNS zone to name agents under, e.g. tunnel.example.com; an agent that asks is told <agent>.<zone>. The server assigns the name only — it does not create the DNS record",
+				Name:  "domain",
+				Usage: "DNS zone to publish agents under, e.g. tun.example.com. Each agent gets a random 24-character subdomain resolving to its leased addresses, served by the built-in nameserver. Delegate the zone to this host with NS records at the parent",
+			},
+			&cli.StringFlag{
+				Name:  "dns-listen",
+				Value: ":53",
+				Usage: "address for the built-in authoritative nameserver (UDP and TCP). Port 53 is privileged: needs root or CAP_NET_BIND_SERVICE",
+			},
+			&cli.StringSliceFlag{
+				Name:  "dns-ns",
+				Usage: "hostnames this zone's NS records name, e.g. ns1.tun.example.com (repeatable). These are what you delegate to at the parent zone",
+			},
+			&cli.IntFlag{
+				Name:  "dns-qps",
+				Value: 0,
+				Usage: "per-source query allowance for the nameserver (0 uses the default). A public authoritative server is an amplification vector; this is what makes it useless for that",
 			},
 		},
 		Action: run,
@@ -103,13 +118,29 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		return err
 	}
 
+	domain := cmd.String("domain")
+	var registry *subdomain.Registry
+	if domain != "" {
+		registry = subdomain.NewRegistry(domain)
+	}
+
 	srv, err := server.New(server.Config{
 		Pool:      addrPool,
 		Auth:      server.StaticTokens(tokens),
 		DenyPorts: denyPorts,
-		Zone:      cmd.String("zone"),
+		Domain:    domain,
+		Registry:  registry,
 		Logger:    log,
 	})
+	if err != nil {
+		return err
+	}
+
+	if registry != nil {
+		if err := startDNS(ctx, cmd, registry, log); err != nil {
+			return err
+		}
+	}
 	if err != nil {
 		return err
 	}

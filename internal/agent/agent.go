@@ -188,10 +188,19 @@ func (a *Agent) Run(ctx context.Context, sess transport.Session) error {
 	if err != nil {
 		return err
 	}
-	a.log.Info("published",
+	published := []any{
 		"ip", strings.Join(leaseAddrs(lease), ","),
 		"ports", portspec.Format(lease.Bound),
-		"target", a.target)
+		"target", a.target,
+	}
+	// The hostname is the whole point of a server that mints subdomains, and it
+	// reaches the operator ONLY here. It used to be logged on the certificate
+	// path alone, so an agent without one was told its addresses and never the
+	// name it had just been given.
+	if lease.Hostname != "" {
+		published = append(published, "hostname", lease.Hostname)
+	}
+	a.log.Info("published", published...)
 	for _, r := range lease.Refused {
 		a.log.Warn("port not published", "port", r.Spec.String(), "reason", r.Reason)
 	}
